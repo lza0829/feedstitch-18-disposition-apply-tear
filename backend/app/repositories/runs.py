@@ -217,9 +217,6 @@ def conflict_status_counts(conn: sqlite3.Connection) -> dict[str, int]:
     counts = {"pending": 0, "adjudicated": 0, "replayed": 0}
     for r in rows:
         counts[r["status"]] = int(r["c"])
-    if counts.get("replayed"):
-        counts["adjudicated"] = counts.get("adjudicated", 0) + counts["replayed"]
-        counts["replayed"] = 0
     counts["total"] = sum(counts.values())
     return counts
 

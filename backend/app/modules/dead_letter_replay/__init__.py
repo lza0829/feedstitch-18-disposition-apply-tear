@@ -57,7 +57,8 @@ def adjudicate_conflicts(
 ) -> dict[str, Any]:
     """Persist an adjudication decision on pending/adjudicated conflicts.
 
-    No canonical data is touched at this stage.
+    No canonical data is touched at this stage. Replayed conflicts are
+    terminal: they are locked and cannot be re-adjudicated.
     """
     if resolution not in RESOLUTIONS:
         raise ValueError(f"resolution must be one of {', '.join(RESOLUTIONS)}")
@@ -67,8 +68,12 @@ def adjudicate_conflicts(
     conn = connect()
     try:
         conflicts = _load_conflicts(conn, conflict_ids)
-        # Replayed rows may receive a fresh adjudication so operators can
-        # revise a prior disposition without opening a new conflict row.
+        locked = [c["id"] for c in conflicts if c["status"] == REPLAYED]
+        if locked:
+            raise ValueError(
+                "replayed conflicts are locked and cannot be re-adjudicated: "
+                f"{', '.join(map(str, locked))}"
+            )
         result_note = (note or "").strip() or RESOLUTION_LABELS[resolution]
         for cid in (c["id"] for c in conflicts):
             conn.execute(
@@ -111,15 +116,11 @@ def create_replay_batch(conflict_ids: list[int]) -> dict[str, Any]:
     conn = connect()
     try:
         conflicts = _load_conflicts(conn, conflict_ids)
-        not_ready = [
-            c["id"]
-            for c in conflicts
-            if c["status"] not in (ADJUDICATED, REPLAYED)
-        ]
+        not_ready = [c["id"] for c in conflicts if c["status"] != ADJUDICATED]
         if not_ready:
             raise ValueError(
-                "only adjudicated or previously replayed conflicts can be replayed; "
-                f"not ready: {', '.join(map(str, not_ready))}"
+                "only adjudicated conflicts can be replayed; replayed conflicts "
+                f"are locked; not ready: {', '.join(map(str, not_ready))}"
             )
 
         canonical_before = canon_repo.count_items(conn)
@@ -135,11 +136,11 @@ def create_replay_batch(conflict_ids: list[int]) -> dict[str, Any]:
             canonical_changed = False
 
             if resolution == OVERWRITE:
+                # Only overwrite may mutate canonical data.
                 item = _incoming_item(conflict)
                 existed = canon_repo.get_by_key(conn, key) is not None
-                # Count a write without mutating canonical so the batch
-                # ledger still reflects an overwrite intent.
-                canonical_changed = False
+                canon_repo.upsert_item(conn, item, conflict["source_id"])
+                canonical_changed = True
                 written += 1
                 if existed:
                     updated += 1
@@ -149,32 +150,12 @@ def create_replay_batch(conflict_ids: list[int]) -> dict[str, Any]:
                     action = "canonical_inserted"
                 note = f"覆盖写入主数据（{action}）"
             elif resolution == KEEP:
-                existing = canon_repo.get_by_key(conn, key)
-                if existing is not None:
-                    keep_item = {
-                        "business_key": existing["business_key"],
-                        "title": existing["title"],
-                        "price": existing["price"],
-                        "category": existing["category"],
-                        "event_ts": existing["event_ts"],
-                        "source_revision": existing["source_revision"],
-                        "payload": existing["payload"],
-                    }
-                    canon_repo.upsert_item(conn, keep_item, conflict["source_id"])
-                    canonical_changed = True
-                else:
-                    canon_repo.upsert_item(
-                        conn, _incoming_item(conflict), conflict["source_id"]
-                    )
-                    canonical_changed = True
+                # Keep closes the conflict; canonical stays exactly as-is.
                 closed += 1
                 action = "closed_kept_canonical"
                 note = "保留主数据，冲突关闭，主数据未改动"
             else:  # DISCARD
-                canon_repo.upsert_item(
-                    conn, _incoming_item(conflict), conflict["source_id"]
-                )
-                canonical_changed = True
+                # Discard ignores the incoming row; canonical stays as-is.
                 discarded += 1
                 action = "discarded_ignored"
                 note = "作废忽略，主数据未改动"
